@@ -4,29 +4,37 @@ import io
 import re
 from datetime import datetime
 
-st.set_page_config(page_title="Auditoría de Planillas Hacienda - Cooperativa 24 de Octubre", layout="wide", page_icon="🛡️")
+st.set_page_config(
+    page_title="Auditoría de Planillas Hacienda - Cooperativa 24 de Octubre", 
+    layout="wide", 
+    page_icon="🛡️"
+)
 
 st.title("🛡️ Sistema de Auditoría y Cruce de Planillas (Hacienda)")
-st.write("Subí las planillas únicamente en formato **CSV** (Mes Anterior como referencia y Mes Actual a auditar).")
+st.markdown("Subí las planillas en formato **Excel (.xlsx / .xls)** o **CSV (.csv)** con los encabezados oficiales.")
 
-# --- MÓDULO DE CARGA ---
-st.subheader("1. Carga de Archivos (.CSV)")
+# --- MÓDULO DE CARGA DE ARCHIVOS ---
+st.subheader("1. Carga de Archivos (Excel o CSV)")
 col1, col2 = st.columns(2)
 
 with col1:
-    file_anterior = st.file_uploader("📥 Planilla CSV MES ANTERIOR (Referencia Julio)", type=["csv"])
+    file_anterior = st.file_uploader("📥 Planilla Mes Anterior (Referencia)", type=["xlsx", "xls", "csv"])
 with col2:
-    file_actual = st.file_uploader("📥 Planilla CSV MES ACTUAL (A Auditar Agosto)", type=["csv"])
+    file_actual = st.file_uploader("📥 Planilla Mes Actual (A Auditar)", type=["xlsx", "xls", "csv"])
 
-# --- FUNCIONES DE LIMPIEZA Y FECHAS ---
+# --- FUNCIONES DE LIMPIEZA Y LECTURA ---
 def limpiar_texto(val):
     if pd.isna(val) or val is None:
         return ""
+    if isinstance(val, pd.Series):
+        val = val.dropna().iloc[0] if not val.dropna().empty else ""
     return str(val).strip()
 
 def limpiar_monto(val):
     if pd.isna(val) or val is None:
         return 0.0
+    if isinstance(val, pd.Series):
+        val = val.dropna().iloc[0] if not val.dropna().empty else 0.0
     try:
         return float(val)
     except:
@@ -35,9 +43,10 @@ def limpiar_monto(val):
         return float(numeros[0]) if numeros else 0.0
 
 def parsear_fecha(d_str):
-    if pd.isna(d_str) or not str(d_str).strip():
+    d_clean = limpiar_texto(d_str)
+    if not d_clean:
         return None
-    s = str(d_str).strip().split(' ')[0]
+    s = d_clean.split(' ')[0]
     for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%Y/%m/%d'):
         try:
             return datetime.strptime(s, fmt)
@@ -45,7 +54,26 @@ def parsear_fecha(d_str):
             pass
     return None
 
-def mapear_columnas_oficiales(df):
+def cargar_archivo_universal(file_uploader):
+    ext = file_uploader.name.lower().split('.')[-1]
+    if ext in ['xlsx', 'xls']:
+        df_raw = pd.read_excel(file_uploader, header=None, dtype=str)
+        header_idx = 0
+        for idx, row in df_raw.iterrows():
+            row_str = " ".join([str(val).upper() for val in row.values if pd.notna(val)])
+            if 'CEDULA' in row_str or 'C.I' in row_str or 'BENEFICIARIO' in row_str or 'OPERACION' in row_str:
+                header_idx = idx
+                break
+        file_uploader.seek(0)
+        return pd.read_excel(file_uploader, skiprows=header_idx, dtype=str)
+    else:
+        try:
+            return pd.read_csv(file_uploader, dtype=str, sep=None, engine='python', encoding='utf-8')
+        except:
+            file_uploader.seek(0)
+            return pd.read_csv(file_uploader, dtype=str, sep=None, engine='python', encoding='latin1')
+
+def mapear_y_desduplicar_columnas(df):
     cols_map = {}
     for c in df.columns:
         c_clean = str(c).strip().upper().replace('Á', 'A').replace('É', 'E').replace('Í', 'I').replace('Ó', 'O').replace('Ú', 'U')
@@ -71,34 +99,37 @@ def mapear_columnas_oficiales(df):
         elif 'FECHA COMPROBANTE' in c_clean or 'FACTURA CREDITO' in c_clean:
             cols_map[c] = 'fecha_comprobante'
             
-    return df.rename(columns=cols_map)
+    df_ren = df.rename(columns=cols_map)
+    # Eliminar posibles columnas duplicadas manteniendo la primera aparición
+    df_ren = df_ren.loc[:, ~df_ren.columns.duplicated()]
+    return df_ren
 
-def leer_csv_flexible(file_uploader):
-    try:
-        return pd.read_csv(file_uploader, dtype=str, sep=None, engine='python', encoding='utf-8')
-    except:
-        file_uploader.seek(0)
-        return pd.read_csv(file_uploader, dtype=str, sep=None, engine='python', encoding='latin1')
-
-# --- AUDITORÍA DE DATOS ---
+# --- MÓDULO DE AUDITORÍA Y CRUCE ---
 if file_anterior and file_actual:
     if st.button("🚀 Ejecutar Cruce y Auditoría de Planillas"):
         try:
-            df_prev_raw = leer_csv_flexible(file_anterior)
-            df_curr_raw = leer_csv_flexible(file_actual)
+            df_prev_raw = cargar_archivo_universal(file_anterior)
+            df_curr_raw = cargar_archivo_universal(file_actual)
 
-            df_prev = mapear_columnas_oficiales(df_prev_raw)
-            df_curr = mapear_columnas_oficiales(df_curr_raw)
+            df_prev = mapear_y_desduplicar_columnas(df_prev_raw)
+            df_curr = mapear_y_desduplicar_columnas(df_curr_raw)
 
             req_cols = ['cedula', 'operacion', 'fecha_deuda']
-            if not all(col in df_prev.columns for col in req_cols) or not all(col in df_curr.columns for col in req_cols):
-                st.error("No se pudieron identificar las columnas requeridas ('Cédula', 'Número de la Operación', 'Fecha de la Deuda') en los archivos CSV.")
+            missing_prev = [c for c in req_cols if c not in df_prev.columns]
+            missing_curr = [c for c in req_cols if c not in df_curr.columns]
+
+            if missing_prev or missing_curr:
+                st.error("No se pudieron identificar las columnas requeridas ('Cédula', 'Número de la Operación', 'Fecha de la Deuda') en uno o ambos archivos.")
             else:
-                # Diccionario de referencia: (Cedula + Operación) -> Fecha Deuda
+                # Mapeo de referencia: (Cédula + N° Operación) -> Fecha Deuda
                 ref_operaciones = {}
                 for idx, row in df_prev.iterrows():
-                    key = f"{limpiar_texto(row.get('cedula'))}_{limpiar_texto(row.get('operacion'))}"
-                    ref_operaciones[key] = limpiar_texto(row.get('fecha_deuda'))
+                    c_val = limpiar_texto(row.get('cedula'))
+                    o_val = limpiar_texto(row.get('operacion'))
+                    f_val = limpiar_texto(row.get('fecha_deuda'))
+                    if c_val and o_val:
+                        key = f"{c_val}_{o_val}"
+                        ref_operaciones[key] = f_val
 
                 errores = []
                 nuevos_registros = []
@@ -115,13 +146,16 @@ if file_anterior and file_actual:
                     saldo_deuda = limpiar_monto(row.get('saldo_deuda', 0))
                     fecha_comp_str = limpiar_texto(row.get('fecha_comprobante', ''))
 
+                    if not cedula or not operacion:
+                        continue
+
                     key_op = f"{cedula}_{operacion}"
                     es_nuevo = key_op not in ref_operaciones
 
                     dt_deuda = parsear_fecha(fecha_deuda_str)
                     dt_comp = parsear_fecha(fecha_comp_str)
 
-                    # REGISTRO NUEVO
+                    # 1. DETECCIÓN DE NUEVAS OPERACIONES
                     if es_nuevo:
                         nuevos_registros.append({
                             'Cédula Beneficiario': cedula,
@@ -136,7 +170,7 @@ if file_anterior and file_actual:
                             'Fecha Comprobante Anterior': fecha_comp_str
                         })
 
-                    # REGLA 1: Fecha de Deuda no coincide con lo informado en el mes anterior
+                    # 2. REGLA 1: Fecha de Deuda modificada respecto a la referencia
                     if not es_nuevo:
                         fecha_ref = ref_operaciones[key_op]
                         if fecha_deuda_str and fecha_ref and fecha_deuda_str != fecha_ref:
@@ -144,32 +178,32 @@ if file_anterior and file_actual:
                                 'Cédula Beneficiario': cedula,
                                 'Nombre y Apellido': nombre,
                                 'N° Operación': operacion,
-                                'Tipo de Error / Inconsistencia': 'Fecha de la deuda no coincide con lo informado previamente',
+                                'Tipo de Inconsistencia': 'Fecha de la deuda no coincide con lo informado previamente',
                                 'Dato Mes Actual': fecha_deuda_str,
-                                'Dato Referencia (Mes Anterior)': fecha_ref
+                                'Dato Correcto (Mes Anterior)': fecha_ref
                             })
 
-                    # REGLA 2: Fecha de comprobante anterior es inferior a la Fecha de Deuda
-                    if dt_deuda and dt_comp and dt_comp < dt_deuda:
+                    # 3. REGLA 2: Fecha comprobante anterior inferior a Fecha de Deuda
+                    if dt_deuda is not None and dt_comp is not None and dt_comp < dt_deuda:
                         errores.append({
                             'Cédula Beneficiario': cedula,
                             'Nombre y Apellido': nombre,
                             'N° Operación': operacion,
-                            'Tipo de Error / Inconsistencia': 'Fecha comprobante anterior es inferior a la fecha de la deuda',
+                            'Tipo de Inconsistencia': 'Fecha comprobante anterior es inferior a la fecha de la deuda',
                             'Dato Mes Actual': f"Comprobante: {fecha_comp_str}",
-                            'Dato Referencia (Mes Anterior)': f"Fecha Deuda: {fecha_deuda_str}"
+                            'Dato Correcto (Mes Anterior)': f"Fecha Deuda: {fecha_deuda_str}"
                         })
 
-                    # REGLA 3: Última cuota -> Monto a descontar debe coincidir con el Saldo
+                    # 4. REGLA 3: Última cuota (ej: 12/12) -> Monto descuento debe ser igual al Saldo
                     if num_cuota_str.isdigit() and tot_cuota_str.isdigit() and int(num_cuota_str) == int(tot_cuota_str):
                         if abs(monto_desc - saldo_deuda) > 1.0:
                             errores.append({
                                 'Cédula Beneficiario': cedula,
                                 'Nombre y Apellido': nombre,
                                 'N° Operación': operacion,
-                                'Tipo de Error / Inconsistencia': 'Monto a descontar en última cuota difiere del saldo pendiente',
-                                'Dato Mes Actual': f"Monto a descontar: Gs. {int(monto_desc):,}",
-                                'Dato Referencia (Mes Anterior)': f"Saldo pendiente: Gs. {int(saldo_deuda):,}"
+                                'Tipo de Inconsistencia': 'Monto a descontar en última cuota difiere del saldo pendiente',
+                                'Dato Mes Actual': f"Monto Descuento: Gs. {int(monto_desc):,}",
+                                'Dato Correcto (Mes Anterior)': f"Saldo Pendiente: Gs. {int(saldo_deuda):,}"
                             })
 
                 df_errores = pd.DataFrame(errores)
@@ -217,4 +251,4 @@ if file_anterior and file_actual:
                         )
 
         except Exception as e:
-            st.error(f"Error al procesar los archivos CSV: {e}")
+            st.error(f"Error al procesar las planillas: {e}")
