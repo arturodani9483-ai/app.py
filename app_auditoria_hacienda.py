@@ -22,7 +22,7 @@ with col1:
 with col2:
     file_actual = st.file_uploader("📥 Planilla Mes Actual (A Auditar)", type=["xlsx", "xls", "csv"])
 
-# --- FUNCIONES DE LIMPIEZA Y LECTURA ---
+# --- FUNCIONES DE LIMPIEZA Y PARSEO DE FECHAS ---
 def limpiar_texto(val):
     if pd.isna(val) or val is None:
         return ""
@@ -47,7 +47,8 @@ def parsear_fecha(d_str):
     if not d_clean:
         return None
     s = d_clean.split(' ')[0]
-    for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%Y/%m/%d'):
+    # Sombra de formatos comunes: 01/01/26, 1/1/2026, 2026-01-01, etc.
+    for fmt in ('%d/%m/%Y', '%d/%m/%y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d', '%d/%m/%Y %H:%M:%S'):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
@@ -100,7 +101,6 @@ def mapear_y_desduplicar_columnas(df):
             cols_map[c] = 'fecha_comprobante'
             
     df_ren = df.rename(columns=cols_map)
-    # Eliminar posibles columnas duplicadas manteniendo la primera aparición
     df_ren = df_ren.loc[:, ~df_ren.columns.duplicated()]
     return df_ren
 
@@ -121,7 +121,7 @@ if file_anterior and file_actual:
             if missing_prev or missing_curr:
                 st.error("No se pudieron identificar las columnas requeridas ('Cédula', 'Número de la Operación', 'Fecha de la Deuda') en uno o ambos archivos.")
             else:
-                # Mapeo de referencia: (Cédula + N° Operación) -> Fecha Deuda
+                # Diccionario de referencia: (Cédula + N° Operación) -> Objeto Datetime y Texto Original
                 ref_operaciones = {}
                 for idx, row in df_prev.iterrows():
                     c_val = limpiar_texto(row.get('cedula'))
@@ -129,7 +129,10 @@ if file_anterior and file_actual:
                     f_val = limpiar_texto(row.get('fecha_deuda'))
                     if c_val and o_val:
                         key = f"{c_val}_{o_val}"
-                        ref_operaciones[key] = f_val
+                        ref_operaciones[key] = {
+                            'str': f_val,
+                            'dt': parsear_fecha(f_val)
+                        }
 
                 errores = []
                 nuevos_registros = []
@@ -170,17 +173,26 @@ if file_anterior and file_actual:
                             'Fecha Comprobante Anterior': fecha_comp_str
                         })
 
-                    # 2. REGLA 1: Fecha de Deuda modificada respecto a la referencia
+                    # 2. REGLA 1: Fecha de Deuda modificada (Comparación inteligente por FECHA REAL)
                     if not es_nuevo:
-                        fecha_ref = ref_operaciones[key_op]
-                        if fecha_deuda_str and fecha_ref and fecha_deuda_str != fecha_ref:
+                        ref_info = ref_operaciones[key_op]
+                        fecha_ref_str = ref_info['str']
+                        dt_ref = ref_info['dt']
+
+                        # Si ambas fechas se pudieron interpretar como objeto fecha, se comparan por fecha real
+                        if dt_deuda is not None and dt_ref is not None:
+                            difiere = (dt_deuda != dt_ref)
+                        else:
+                            difiere = (fecha_deuda_str != fecha_ref_str)
+
+                        if difiere:
                             errores.append({
                                 'Cédula Beneficiario': cedula,
                                 'Nombre y Apellido': nombre,
                                 'N° Operación': operacion,
                                 'Tipo de Inconsistencia': 'Fecha de la deuda no coincide con lo informado previamente',
                                 'Dato Mes Actual': fecha_deuda_str,
-                                'Dato Correcto (Mes Anterior)': fecha_ref
+                                'Dato Correcto (Mes Anterior)': fecha_ref_str
                             })
 
                     # 3. REGLA 2: Fecha comprobante anterior inferior a Fecha de Deuda
@@ -217,7 +229,7 @@ if file_anterior and file_actual:
                     if df_errores.empty:
                         st.success("✅ ¡Sin errores detectados!")
                     else:
-                        st.warning(f"Se encontraron {len(df_errores)} errores.")
+                        st.warning(f"Se encontraron {len(df_errores)} errores reales.")
                         st.dataframe(df_errores, use_container_width=True)
 
                         out_e = io.BytesIO()
